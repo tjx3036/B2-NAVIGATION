@@ -23,6 +23,10 @@ def generate_launch_description():
             'use_dwa_planner',
             default_value='true',
             description='Use custom DWA as local planner instead of Nav2 RegulatedPurePursuit'),
+        DeclareLaunchArgument(
+            'use_scan_bridge',
+            default_value='true',
+            description='Enable velodyne PointCloud2 to LaserScan bridge'),
 
         # Pure DWA mode: keep controller_server for local_costmap/recovery services.
         # Its FollowPath action is fully remapped to /nav2_follow_path to avoid conflict.
@@ -117,6 +121,18 @@ def generate_launch_description():
             name='bt_navigator',
             output='screen',
             parameters=[params_file, {'use_sim_time': LaunchConfiguration('use_sim_time')}]
+        ),
+        Node(
+            package='velodyne_laserscan',
+            executable='velodyne_laserscan_node',
+            name='velodyne_laserscan_node',
+            output='screen',
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+            remappings=[
+                ('velodyne_points', '/velodyne_points'),
+                ('scan', '/scan'),
+            ],
+            condition=IfCondition(LaunchConfiguration('use_scan_bridge')),
         ),
         # 自定义 DWA 局部规划器：订阅 /plan，发布 /cmd_vel，替代 Nav2 controller 的输出
         # controller_server 仍运行（为 BT 提供 FollowPath 接口，并发布 local_costmap），但其 /nav2_cmd_vel 不被使用

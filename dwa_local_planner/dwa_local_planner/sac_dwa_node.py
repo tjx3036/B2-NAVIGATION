@@ -31,7 +31,8 @@ from nav2_msgs.action import FollowPath
 from nav2_msgs.srv import ClearEntireCostmap
 from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from rclpy.node import Node
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, PointCloud2
+from sensor_msgs_py import point_cloud2
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 
 from dwa_local_planner.dwa_planner import DWAPlanner
@@ -50,22 +51,33 @@ class SACDWANode(Node):
         self.planner.control_interval = 1.0 / self.control_hz
 
         # 参考 ros2-robot-navigation-exploration: lookahead 0.5, 前方角度范围
-        self.lookahead_dist = 1.2       # 前瞻距离 (m)
+        self.lookahead_dist = 0.9       # 前瞻距离 (m)
         self.lookahead_angle_range = math.pi * 2 / 3  # 前方 120° 内选点（exploration 60°偏严，弯道易无点）
-        self.emergency_stop_dist = 0.12
-        self.min_cmd_linear_speed = 0.20
+        self.emergency_stop_dist = 0.26
+        self.min_cmd_linear_speed = 0.08
         self.goal_stop_tolerance = 0.25  # 到达判定
         self.goal_slow_dist = 1.0       # 该距离内减速
         self.slowing_factor = 2.0
 
         self._scan_min_dist = 10.0
+        self._scan_points_xy = np.empty((0, 2), dtype=np.float32)
+        self._pc_points_xy = np.empty((0, 2), dtype=np.float32)
+        self.scan_timeout_s = 0.8
+        self.costmap_timeout_s = 1.0
+        self._last_scan_t = 0.0
+        self._last_points_t = 0.0
+        self._last_costmap_t = 0.0
         self._last_plan: Optional[Path] = None
+        self._plan_frame = "map"
+        self._odom_frame = "odom"
         self._has_odom = False
         self._has_real_odom = False
         self._robot_model_candidates = ["robot_model", "b2_gazebo", "b2"]
         self._final_goal_xy: Optional[tuple[float, float]] = None
         self._goal_token = 0
         self._goal_lock = threading.Lock()
+        self._last_goal_accept_log_t = 0.0
+        self._last_frame_warn_t = 0.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -81,6 +93,9 @@ class SACDWANode(Node):
         )
         self.sub_scan = self.create_subscription(
             LaserScan, "/scan", self.on_scan, 20, callback_group=self._ctrl_group
+        )
+        self.sub_points = self.create_subscription(
+            PointCloud2, "/velodyne_points", self.on_points, 10, callback_group=self._ctrl_group
         )
         self.sub_costmap = self.create_subscription(
             OccupancyGrid, "/local_costmap/costmap", self.on_costmap, 10, callback_group=self._ctrl_group
@@ -139,18 +154,33 @@ class SACDWANode(Node):
             my_token = self._goal_token
         req = goal_handle.request
         self._last_plan = req.path
+        self._plan_frame = req.path.header.frame_id if req.path.header.frame_id else "map"
         last_pose = req.path.poses[-1].pose.position
-        self._final_goal_xy = (float(last_pose.x), float(last_pose.y))
-        self.get_logger().info(f"FollowPath accepted: {len(req.path.poses)} poses.")
+        gx, gy, ok = self._transform_xy(float(last_pose.x), float(last_pose.y), self._plan_frame, self._odom_frame)
+        if not ok:
+            self.get_logger().warn(
+                f"Reject FollowPath goal: cannot transform final goal {self._plan_frame}->{self._odom_frame}."
+            )
+            self._last_plan = None
+            self._final_goal_xy = None
+            self.pub_cmd.publish(Twist())
+            if goal_handle.is_active:
+                goal_handle.abort()
+            return FollowPath.Result()
+        self._final_goal_xy = (gx, gy)
+        now_t = time.time()
+        if now_t - self._last_goal_accept_log_t > 1.0:
+            self.get_logger().info(f"FollowPath accepted: {len(req.path.poses)} poses.")
+            self._last_goal_accept_log_t = now_t
 
         feedback = FollowPath.Feedback()
         result = FollowPath.Result()
         while rclpy.ok():
             with self._goal_lock:
                 if my_token != self._goal_token:
-                    # 新目标已接管，当前目标需显式结束状态，避免 "Goal state not set" 警告
+                    # 抢占不是客户端 cancel，避免非法状态迁移
                     if goal_handle.is_active:
-                        goal_handle.canceled()
+                        goal_handle.abort()
                     return result
             if goal_handle.is_cancel_requested:
                 self._last_plan = None
@@ -178,12 +208,14 @@ class SACDWANode(Node):
                     if goal_handle.is_active:
                         goal_handle.succeed()
                     return result
-            time.sleep(0.1)
+            time.sleep(0.05)
         if rclpy.ok() and goal_handle.is_active:
             goal_handle.abort()
         return result
 
     def on_odom(self, msg: Odometry):
+        if msg.header.frame_id:
+            self._odom_frame = msg.header.frame_id
         self._publish_odom_tf(msg)
         self.planner.update_robot_state(msg)
         self._has_odom = True
@@ -251,11 +283,14 @@ class SACDWANode(Node):
 
     def on_plan(self, msg: Path):
         self._last_plan = msg
+        if msg.header.frame_id:
+            self._plan_frame = msg.header.frame_id
         self._update_target_from_path()
 
     def on_scan(self, msg: LaserScan):
+        self._last_scan_t = time.monotonic()
         ranges = np.asarray(msg.ranges, dtype=np.float32)
-        valid_min = max(float(msg.range_min), 0.20)
+        valid_min = max(float(msg.range_min), 0.03)
         valid = np.isfinite(ranges) & (ranges > valid_min) & (ranges < msg.range_max)
         angles = msg.angle_min + np.arange(ranges.shape[0], dtype=np.float32) * msg.angle_increment
         forward_sector = np.abs(angles) <= 0.70
@@ -267,7 +302,87 @@ class SACDWANode(Node):
         else:
             self._scan_min_dist = 10.0
 
+        # 将激光点转换到世界坐标，作为 DWA 的 costmap 失效兜底障碍输入
+        if self.planner.current_pose is not None and np.any(valid):
+            # 适度下采样，降低计算负担
+            idx = np.where(valid)[0][::4]
+            if idx.size > 0:
+                rr = ranges[idx]
+                aa = angles[idx]
+                yaw = self.planner.quaternion_to_yaw(self.planner.current_pose.orientation)
+                rx = float(self.planner.current_pose.position.x)
+                ry = float(self.planner.current_pose.position.y)
+                wx = rx + rr * np.cos(yaw + aa)
+                wy = ry + rr * np.sin(yaw + aa)
+                pts = np.stack((wx, wy), axis=1)
+                self._scan_points_xy = pts
+            else:
+                self._scan_points_xy = np.empty((0, 2), dtype=np.float32)
+        else:
+            self._scan_points_xy = np.empty((0, 2), dtype=np.float32)
+        self._push_obstacle_points_to_planner()
+
+    def on_points(self, msg: PointCloud2):
+        self._last_points_t = time.monotonic()
+        if self.planner.current_pose is None:
+            self._pc_points_xy = np.empty((0, 2), dtype=np.float32)
+            self._push_obstacle_points_to_planner()
+            return
+
+        try:
+            pts_iter = point_cloud2.read_points(
+                msg, field_names=("x", "y", "z"), skip_nans=True
+            )
+            pts = np.asarray(list(pts_iter), dtype=np.float32)
+        except Exception:
+            pts = np.empty((0, 3), dtype=np.float32)
+
+        if pts.size == 0:
+            self._pc_points_xy = np.empty((0, 2), dtype=np.float32)
+            self._push_obstacle_points_to_planner()
+            return
+
+        # 仅保留可能构成障碍的高度与距离，抑制地面和远点噪声
+        x = pts[:, 0]
+        y = pts[:, 1]
+        z = pts[:, 2]
+        r2 = x * x + y * y
+        mask = (z > 0.05) & (z < 1.6) & (r2 > 0.05 * 0.05) & (r2 < 6.0 * 6.0)
+        pts = pts[mask]
+        if pts.shape[0] == 0:
+            self._pc_points_xy = np.empty((0, 2), dtype=np.float32)
+            self._push_obstacle_points_to_planner()
+            return
+
+        # 下采样降低计算负担
+        pts = pts[::6]
+        rx = float(self.planner.current_pose.position.x)
+        ry = float(self.planner.current_pose.position.y)
+        yaw = self.planner.quaternion_to_yaw(self.planner.current_pose.orientation)
+        c = math.cos(yaw)
+        s = math.sin(yaw)
+        px = pts[:, 0]
+        py = pts[:, 1]
+        wx = rx + c * px - s * py
+        wy = ry + s * px + c * py
+        self._pc_points_xy = np.stack((wx, wy), axis=1).astype(np.float32)
+        self._push_obstacle_points_to_planner()
+
+    def _push_obstacle_points_to_planner(self):
+        if self._pc_points_xy.shape[0] > 0 and self._scan_points_xy.shape[0] > 0:
+            pts = np.concatenate((self._pc_points_xy, self._scan_points_xy), axis=0)
+        elif self._pc_points_xy.shape[0] > 0:
+            pts = self._pc_points_xy
+        else:
+            pts = self._scan_points_xy
+
+        if pts.shape[0] > 0:
+            self.planner.update_scan_points(pts)
+        else:
+            self.planner.update_scan_points(None)
+
     def on_costmap(self, msg: OccupancyGrid):
+        self._last_costmap_t = time.monotonic()
         h = msg.info.height
         w = msg.info.width
         if h == 0 or w == 0:
@@ -287,7 +402,25 @@ class SACDWANode(Node):
         ry = float(self.planner.current_pose.position.y)
         robot_angle = self.planner.quaternion_to_yaw(self.planner.current_pose.orientation)
 
-        pts = [(p.pose.position.x, p.pose.position.y) for p in self._last_plan.poses]
+        pts = []
+        tf_ok = True
+        for p in self._last_plan.poses:
+            x, y, ok = self._transform_xy(
+                float(p.pose.position.x), float(p.pose.position.y), self._plan_frame, self._odom_frame
+            )
+            if not ok:
+                tf_ok = False
+                break
+            pts.append((x, y))
+        if not tf_ok:
+            now_t = time.time()
+            if now_t - self._last_frame_warn_t > 2.0:
+                self.get_logger().warn(
+                    f"Plan/odom frame transform unavailable: {self._plan_frame} -> {self._odom_frame}. "
+                    "DWA target update skipped."
+                )
+                self._last_frame_warn_t = now_t
+            return
         if len(pts) < 2:
             self.planner.set_target(pts[0][0], pts[0][1])
             return
@@ -304,20 +437,28 @@ class SACDWANode(Node):
                 closest_idx = i
 
         if closest_idx < 0:
-            # 没有前方点，退化为用路径终点
-            tx, ty = pts[-1]
-            self.planner.set_target(tx, ty)
-            return
+            # 没有前方点时，不直接追终点；改为路径最近点，避免跨障碍“硬切”
+            closest_idx = min(
+                range(len(pts)),
+                key=lambda i: math.hypot(pts[i][0] - rx, pts[i][1] - ry)
+            )
 
-        # 2. 从最近点沿路径向前，找第一个距离 >= lookahead_dist 的点
+        # 2. 近障碍时缩短前瞻，优先先绕过眼前障碍再追远端目标
+        effective_lookahead = self.lookahead_dist
+        if self._scan_min_dist < 0.7:
+            effective_lookahead = 0.50
+        elif self._scan_min_dist < 1.0:
+            effective_lookahead = 0.65
+
+        # 3. 从最近点沿路径向前，找第一个距离 >= lookahead_dist 的点
         for i in range(closest_idx, len(pts)):
             px, py = pts[i]
             dist = math.hypot(px - rx, py - ry)
-            if dist >= self.lookahead_dist:
+            if dist >= effective_lookahead:
                 self.planner.set_target(px, py)
                 return
 
-        # 3. 没有足够远的点，用路径终点
+        # 4. 没有足够远的点，用路径终点
         tx, ty = pts[-1]
         self.planner.set_target(tx, ty)
 
@@ -325,11 +466,11 @@ class SACDWANode(Node):
         """按障碍距离自适应：本算法仅一个障碍项，近时须提高 obstacle"""
         d = self._scan_min_dist
         if d < 0.45:
-            self.planner.set_weights(direction=0.35, obstacle=0.40, velocity=0.25)   # 很近障碍，先安全
+            self.planner.set_weights(direction=0.30, obstacle=0.52, velocity=0.18)   # 很近障碍，强避障
         elif d < 1.0:
-            self.planner.set_weights(direction=0.38, obstacle=0.28, velocity=0.34)
+            self.planner.set_weights(direction=0.34, obstacle=0.44, velocity=0.22)
         else:
-            self.planner.set_weights(direction=0.40, obstacle=0.18, velocity=0.42)  # 远障多走
+            self.planner.set_weights(direction=0.40, obstacle=0.34, velocity=0.26)
 
     def _heading_error_to_target(self) -> Optional[float]:
         """机器人朝向与目标方向的偏差 (rad)，[-pi, pi]"""
@@ -357,13 +498,51 @@ class SACDWANode(Node):
         dy = float(self._final_goal_xy[1]) - float(self.planner.current_pose.position.y)
         return math.hypot(dx, dy)
 
+    def _transform_xy(self, x: float, y: float, from_frame: str, to_frame: str) -> tuple[float, float, bool]:
+        if from_frame == to_frame:
+            return x, y, True
+        try:
+            t = self.tf_buffer.lookup_transform(
+                to_frame, from_frame, rclpy.time.Time(), rclpy.duration.Duration(seconds=0.2)
+            )
+            tx = float(t.transform.translation.x)
+            ty = float(t.transform.translation.y)
+            yaw = self.planner.quaternion_to_yaw(t.transform.rotation)
+            cx = math.cos(yaw)
+            sx = math.sin(yaw)
+            nx = tx + cx * x - sx * y
+            ny = ty + sx * x + cx * y
+            return nx, ny, True
+        except Exception:
+            return x, y, False
+
     def on_timer(self):
         if not self._has_odom:
             if not self._try_tf_fallback():
                 return
 
+        if self._plan_frame != self._odom_frame:
+            now_t = time.time()
+            if now_t - self._last_frame_warn_t > 2.0:
+                self.get_logger().warn(
+                    f"Frame mismatch detected: plan={self._plan_frame}, odom={self._odom_frame}. "
+                    "Target points will be transformed before DWA scoring."
+                )
+                self._last_frame_warn_t = now_t
+
         self._update_target_from_path()
         self._update_adaptive_weights()
+
+        now_mono = time.monotonic()
+        scan_fresh = (now_mono - self._last_scan_t) <= self.scan_timeout_s
+        costmap_fresh = (now_mono - self._last_costmap_t) <= self.costmap_timeout_s
+        if not scan_fresh or not costmap_fresh:
+            cmd = Twist()
+            cmd.linear.x = 0.0
+            # 输入失效时仅允许很小角速度搜索，不允许盲目前进
+            cmd.angular.z = 0.25 if self._last_plan is not None else 0.0
+            self.pub_cmd.publish(cmd)
+            return
 
         # 无全局路径时不发速度，避免朝错误方向移动
         if self._last_plan is None or len(self._last_plan.poses) == 0:
@@ -413,11 +592,17 @@ class SACDWANode(Node):
                 # 大偏差时减速前进，允许边走边转
                 cmd.linear.x = min(float(cmd.linear.x), 0.12)
 
-        # 朝向基本对准时强制最小前进速度
+        # 近障碍时优先限制前进速度，避免“继续顶着障碍走”
+        if self._scan_min_dist < 0.45:
+            cmd.linear.x = min(float(cmd.linear.x), 0.06)
+        elif self._scan_min_dist < 0.70:
+            cmd.linear.x = min(float(cmd.linear.x), 0.10)
+
+        # 朝向基本对准时强制最小前进速度（仅在前方障碍较远时启用）
         if (
             final_goal_dist is not None
             and final_goal_dist > self.goal_stop_tolerance
-            and self._scan_min_dist > self.emergency_stop_dist
+            and self._scan_min_dist > 0.90
             and (heading_err is None or abs(heading_err) < 0.55)
             and abs(float(cmd.linear.x)) < self.min_cmd_linear_speed
         ):
@@ -429,7 +614,7 @@ def main():
     rclpy.init()
     node = SACDWANode()
     try:
-        executor = MultiThreadedExecutor(num_threads=2)
+        executor = MultiThreadedExecutor(num_threads=4)
         executor.add_node(node)
         executor.spin()
     finally:

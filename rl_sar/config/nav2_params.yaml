@@ -4,9 +4,9 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom         
-    bt_loop_duration: 10
-    default_server_timeout: 20
-    wait_for_service_timeout: 1000
+    bt_loop_duration: 50
+    default_server_timeout: 3000
+    wait_for_service_timeout: 5000
 
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
@@ -61,9 +61,9 @@ controller_server:
   ros__parameters:
     use_sim_time: true
     controller_frequency: 20.0
-    odom_frame: map          
+    odom_frame: odom
     base_frame_id: base_link
-    global_frame: map
+    global_frame: odom
     progress_checker_plugin: "progress_checker"
     goal_checker_plugins: ["goal_checker"]
     controller_plugins: ["FollowPath"]
@@ -112,6 +112,7 @@ global_costmap:
       use_sim_time: true
       global_frame: map
       robot_base_frame: base_link
+      robot_radius: 0.28
       rolling_window: false
 
       origin_x: -20.0    # 扩展以包含机器人初始位置 (0,0) 及传感器 (-0.49, 1.60)
@@ -119,7 +120,7 @@ global_costmap:
       width: 80          # 覆盖 X: [-20, 60]
       height: 60         
       resolution: 0.05
-      footprint_padding: 0.01
+      footprint_padding: 0.05
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -148,25 +149,25 @@ local_costmap:
   local_costmap:
     ros__parameters:
       use_sim_time: true
-      global_frame: map
+      global_frame: odom
       robot_base_frame: base_link
+      robot_radius: 0.28
       rolling_window: true
+      update_frequency: 10.0
+      publish_frequency: 5.0
+      always_send_full_costmap: true
       width: 10
       height: 10
       resolution: 0.05
-      footprint_padding: 0.01
+      footprint_padding: 0.05
 
-      plugins: ["voxel_layer", "inflation_layer"]
+      plugins: ["obstacle_layer", "inflation_layer"]
 
-      voxel_layer:
-        plugin: "nav2_costmap_2d::VoxelLayer"
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
-        publish_voxel_map: True
-        origin_z: 0.0
-        z_resolution: 0.05
-        z_voxels: 16
         max_obstacle_height: 2.0
-        mark_threshold: 0
+        observation_persistence: 0.3
         observation_sources: scan
         scan:
           topic: /scan
@@ -174,16 +175,16 @@ local_costmap:
           clearing: True
           marking: True
           data_type: "LaserScan"
-          raytrace_max_range: 10.0
+          raytrace_max_range: 6.0
           raytrace_min_range: 0.0
-          obstacle_max_range: 9.5
-          obstacle_min_range: 0.0
+          obstacle_max_range: 5.0
+          obstacle_min_range: 0.08
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.4
-        cost_scaling_factor: 2.5
+        inflation_radius: 0.45
+        cost_scaling_factor: 2.2
 
 behavior_server:
   ros__parameters:
