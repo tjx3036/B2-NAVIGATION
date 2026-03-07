@@ -112,7 +112,7 @@ global_costmap:
       use_sim_time: true
       global_frame: map
       robot_base_frame: base_link
-      robot_radius: 0.28
+      robot_radius: 0.24
       rolling_window: false
 
       origin_x: -20.0    # 扩展以包含机器人初始位置 (0,0) 及传感器 (-0.49, 1.60)
@@ -120,7 +120,7 @@ global_costmap:
       width: 80          # 覆盖 X: [-20, 60]
       height: 60         
       resolution: 0.05
-      footprint_padding: 0.05
+      footprint_padding: 0.03
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -142,8 +142,8 @@ global_costmap:
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.4
-        cost_scaling_factor: 2.5
+        inflation_radius: 0.60
+        cost_scaling_factor: 3.0
 
 local_costmap:
   local_costmap:
@@ -151,7 +151,7 @@ local_costmap:
       use_sim_time: true
       global_frame: odom
       robot_base_frame: base_link
-      robot_radius: 0.28
+      robot_radius: 0.24
       rolling_window: true
       update_frequency: 10.0
       publish_frequency: 5.0
@@ -159,7 +159,7 @@ local_costmap:
       width: 10
       height: 10
       resolution: 0.05
-      footprint_padding: 0.05
+      footprint_padding: 0.03
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -178,13 +178,13 @@ local_costmap:
           raytrace_max_range: 6.0
           raytrace_min_range: 0.0
           obstacle_max_range: 5.0
-          obstacle_min_range: 0.08
+          obstacle_min_range: 0.20
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.45
-        cost_scaling_factor: 2.2
+        inflation_radius: 0.70
+        cost_scaling_factor: 3.8
 
 behavior_server:
   ros__parameters:

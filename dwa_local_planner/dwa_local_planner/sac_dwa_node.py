@@ -53,7 +53,8 @@ class SACDWANode(Node):
         # 参考 ros2-robot-navigation-exploration: lookahead 0.5, 前方角度范围
         self.lookahead_dist = 0.9       # 前瞻距离 (m)
         self.lookahead_angle_range = math.pi * 2 / 3  # 前方 120° 内选点（exploration 60°偏严，弯道易无点）
-        self.emergency_stop_dist = 0.26
+        # 仅用于“硬急停”，阈值不宜过大，否则会在未触及膨胀边界前就频繁停住
+        self.emergency_stop_dist = 0.18
         self.min_cmd_linear_speed = 0.08
         self.goal_stop_tolerance = 0.25  # 到达判定
         self.goal_slow_dist = 1.0       # 该距离内减速
@@ -78,6 +79,11 @@ class SACDWANode(Node):
         self._goal_lock = threading.Lock()
         self._last_goal_accept_log_t = 0.0
         self._last_frame_warn_t = 0.0
+        self._last_diag_log_t = 0.0
+        self._progress_anchor_t = 0.0
+        self._progress_anchor_xy: Optional[tuple[float, float]] = None
+        self._recovery_until_t = 0.0
+        self._recovery_turn_sign = 1.0
 
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -295,10 +301,11 @@ class SACDWANode(Node):
         angles = msg.angle_min + np.arange(ranges.shape[0], dtype=np.float32) * msg.angle_increment
         forward_sector = np.abs(angles) <= 0.70
         front_valid = valid & forward_sector
+        # 用低分位替代绝对最小值，抑制单点噪声/自体回波导致的“提前刹停”
         if np.any(front_valid):
-            self._scan_min_dist = float(np.min(ranges[front_valid]))
+            self._scan_min_dist = float(np.percentile(ranges[front_valid], 10.0))
         elif np.any(valid):
-            self._scan_min_dist = float(np.min(ranges[valid]))
+            self._scan_min_dist = float(np.percentile(ranges[valid], 10.0))
         else:
             self._scan_min_dist = 10.0
 
@@ -443,18 +450,15 @@ class SACDWANode(Node):
                 key=lambda i: math.hypot(pts[i][0] - rx, pts[i][1] - ry)
             )
 
-        # 2. 近障碍时缩短前瞻，优先先绕过眼前障碍再追远端目标
+        # 2. 使用固定前瞻，避免近障碍时目标点过近导致速度反复掉到 0
         effective_lookahead = self.lookahead_dist
-        if self._scan_min_dist < 0.7:
-            effective_lookahead = 0.50
-        elif self._scan_min_dist < 1.0:
-            effective_lookahead = 0.65
 
         # 3. 从最近点沿路径向前，找第一个距离 >= lookahead_dist 的点
         for i in range(closest_idx, len(pts)):
             px, py = pts[i]
             dist = math.hypot(px - rx, py - ry)
-            if dist >= effective_lookahead:
+            # 避免选择离机器人过近的局部目标点（会导致“原地犹豫”）
+            if dist >= effective_lookahead and dist >= 0.45:
                 self.planner.set_target(px, py)
                 return
 
@@ -519,6 +523,10 @@ class SACDWANode(Node):
     def on_timer(self):
         if not self._has_odom:
             if not self._try_tf_fallback():
+                now_t = time.monotonic()
+                if now_t - self._last_diag_log_t > 0.5:
+                    self.get_logger().info("[DWA_DIAG] return=no_odom")
+                    self._last_diag_log_t = now_t
                 return
 
         if self._plan_frame != self._odom_frame:
@@ -531,18 +539,6 @@ class SACDWANode(Node):
                 self._last_frame_warn_t = now_t
 
         self._update_target_from_path()
-        self._update_adaptive_weights()
-
-        now_mono = time.monotonic()
-        scan_fresh = (now_mono - self._last_scan_t) <= self.scan_timeout_s
-        costmap_fresh = (now_mono - self._last_costmap_t) <= self.costmap_timeout_s
-        if not scan_fresh or not costmap_fresh:
-            cmd = Twist()
-            cmd.linear.x = 0.0
-            # 输入失效时仅允许很小角速度搜索，不允许盲目前进
-            cmd.angular.z = 0.25 if self._last_plan is not None else 0.0
-            self.pub_cmd.publish(cmd)
-            return
 
         # 无全局路径时不发速度，避免朝错误方向移动
         if self._last_plan is None or len(self._last_plan.poses) == 0:
@@ -550,64 +546,92 @@ class SACDWANode(Node):
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             self.pub_cmd.publish(cmd)
-            return
-
-        if self._scan_min_dist <= self.emergency_stop_dist:
-            cmd = Twist()
-            cmd.linear.x = 0.0
-            cmd.angular.z = 0.0
-            self.pub_cmd.publish(cmd)
+            now_t = time.monotonic()
+            if now_t - self._last_diag_log_t > 0.5:
+                self.get_logger().info("[DWA_DIAG] return=no_plan")
+                self._last_diag_log_t = now_t
             return
 
         # 到达最终 goal 时停止（不要用前瞻点，否则会“到点不停”）
         final_goal_dist = self._distance_to_final_goal()
-        target_dist = self._distance_to_target()
         if final_goal_dist is not None and final_goal_dist <= self.goal_stop_tolerance:
             cmd = Twist()
             cmd.linear.x = 0.0
             cmd.angular.z = 0.0
             self.pub_cmd.publish(cmd)
+            now_t = time.monotonic()
+            if now_t - self._last_diag_log_t > 0.5:
+                self.get_logger().info(
+                    f"[DWA_DIAG] return=goal_reached final_goal_dist={final_goal_dist:.3f}"
+                )
+                self._last_diag_log_t = now_t
+            return
+
+        # 进展监控：2s 内位移过小则触发短时原地转向脱困
+        now_t = time.monotonic()
+        if self.planner.current_pose is not None:
+            cur_xy = (
+                float(self.planner.current_pose.position.x),
+                float(self.planner.current_pose.position.y),
+            )
+            if self._progress_anchor_xy is None:
+                self._progress_anchor_xy = cur_xy
+                self._progress_anchor_t = now_t
+            elif now_t - self._progress_anchor_t >= 2.0:
+                moved = math.hypot(cur_xy[0] - self._progress_anchor_xy[0], cur_xy[1] - self._progress_anchor_xy[1])
+                # 距终点仍较远且几乎无位移，判定为局部受困
+                if (final_goal_dist is None or final_goal_dist > self.goal_stop_tolerance + 0.4) and moved < 0.05:
+                    heading_err = self._heading_error_to_target()
+                    self._recovery_turn_sign = 1.0 if (heading_err is None or heading_err >= 0.0) else -1.0
+                    self._recovery_until_t = now_t + 1.2
+                self._progress_anchor_xy = cur_xy
+                self._progress_anchor_t = now_t
+
+        if now_t < self._recovery_until_t:
+            cmd = Twist()
+            cmd.linear.x = 0.0
+            cmd.angular.z = 0.7 * self._recovery_turn_sign
+            self.pub_cmd.publish(cmd)
+            if now_t - self._last_diag_log_t > 0.5:
+                self.get_logger().info(
+                    f"[DWA_DIAG] return=recovery_spin w={cmd.angular.z:.3f} "
+                    f"scan_min={self._scan_min_dist:.3f} "
+                    f"goal_dist={final_goal_dist if final_goal_dist is not None else -1.0:.3f}"
+                )
+                self._last_diag_log_t = now_t
             return
 
         cmd = self.planner.generate_velocity_command()
-        heading_err = self._heading_error_to_target()
+        dbg = self.planner.last_debug if isinstance(self.planner.last_debug, dict) else {}
 
-        # 接近目标减速（RotateToGoal 思路）
-        if (
-            final_goal_dist is not None
-            and final_goal_dist < self.goal_slow_dist
-            and final_goal_dist > self.goal_stop_tolerance
-        ):
-            scale = final_goal_dist / self.goal_slow_dist
-            scale = max(1.0 / self.slowing_factor, scale)
-            cmd.linear.x = float(cmd.linear.x) * scale
+        # 反停滞：环境判定安全但 DWA 选到极小线速度时，给一个小前推避免“原地犹豫”
+        anti_stall_applied = False
+        safe_by_score = float(dbg.get("obs_max", 0.0)) >= 0.75
+        low_v = abs(float(cmd.linear.x)) <= 0.03
+        heading_not_too_large = abs(float(cmd.angular.z)) <= 0.45
+        if safe_by_score and low_v and heading_not_too_large and self._scan_min_dist > 0.75:
+            cmd.linear.x = 0.16
+            anti_stall_applied = True
 
-        # 大角度先转向（exploration 无此逻辑，但目标已限定前方，保留保险）
-        if heading_err is not None:
-            if abs(heading_err) > 2.4:    # 偏差极大时才原地转，避免“原地打圈”
-                cmd.linear.x = 0.0
-                if abs(float(cmd.angular.z)) < 0.5:
-                    cmd.angular.z = 0.5 * (1.0 if heading_err > 0 else -1.0)
-            elif abs(heading_err) > 1.2:
-                # 大偏差时减速前进，允许边走边转
-                cmd.linear.x = min(float(cmd.linear.x), 0.12)
-
-        # 近障碍时优先限制前进速度，避免“继续顶着障碍走”
-        if self._scan_min_dist < 0.45:
-            cmd.linear.x = min(float(cmd.linear.x), 0.06)
-        elif self._scan_min_dist < 0.70:
-            cmd.linear.x = min(float(cmd.linear.x), 0.10)
-
-        # 朝向基本对准时强制最小前进速度（仅在前方障碍较远时启用）
-        if (
-            final_goal_dist is not None
-            and final_goal_dist > self.goal_stop_tolerance
-            and self._scan_min_dist > 0.90
-            and (heading_err is None or abs(heading_err) < 0.55)
-            and abs(float(cmd.linear.x)) < self.min_cmd_linear_speed
-        ):
-            cmd.linear.x = self.min_cmd_linear_speed
         self.pub_cmd.publish(cmd)
+        now_t = time.monotonic()
+        if now_t - self._last_diag_log_t > 0.5:
+            self.get_logger().info(
+                "[DWA_DIAG] return=publish_cmd "
+                f"scan_min={self._scan_min_dist:.3f} "
+                f"goal_dist={final_goal_dist if final_goal_dist is not None else -1.0:.3f} "
+                f"target=({self.planner.target_x:.2f},{self.planner.target_y:.2f}) "
+                f"cmd=({float(cmd.linear.x):.3f},{float(cmd.angular.z):.3f}) "
+                f"dwa_status={dbg.get('status', 'na')} "
+                f"best_v={float(dbg.get('best_v', 0.0)):.3f} "
+                f"best_w={float(dbg.get('best_w', 0.0)):.3f} "
+                f"best_score={float(dbg.get('best_score', -1.0)):.3f} "
+                f"obs_min={float(dbg.get('obs_min', -1.0)):.3f} "
+                f"obs_max={float(dbg.get('obs_max', -1.0)):.3f} "
+                f"forced_min_progress={int(bool(dbg.get('forced_min_progress', False)))} "
+                f"anti_stall={int(anti_stall_applied)}"
+            )
+            self._last_diag_log_t = now_t
 
 
 def main():
