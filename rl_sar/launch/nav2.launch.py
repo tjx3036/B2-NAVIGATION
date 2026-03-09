@@ -27,6 +27,10 @@ def generate_launch_description():
             'use_scan_bridge',
             default_value='true',
             description='Enable velodyne PointCloud2 to LaserScan bridge'),
+        DeclareLaunchArgument(
+            'alias_map_to_odom',
+            default_value='false',
+            description='Treat map and odom as identical in custom DWA node'),
 
         # Pure DWA mode: keep controller_server for local_costmap/recovery services.
         # Its FollowPath action is fully remapped to /nav2_follow_path to avoid conflict.
@@ -134,14 +138,26 @@ def generate_launch_description():
             ],
             condition=IfCondition(LaunchConfiguration('use_scan_bridge')),
         ),
-        # 自定义 DWA 局部规划器：订阅 /plan，发布 /cmd_vel，替代 Nav2 controller 的输出
+        # 自定义 DWA 局部规划器：订阅 /plan，发布 /cmd_vel 和 /scan_for_costmap（过滤动态）
         # controller_server 仍运行（为 BT 提供 FollowPath 接口，并发布 local_costmap），但其 /nav2_cmd_vel 不被使用
         Node(
             package='dwa_local_planner',
             executable='sac_dwa_node',
             name='dwa_local_planner',
             output='screen',
-            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+            parameters=[
+                {'use_sim_time': LaunchConfiguration('use_sim_time')},
+                {'alias_map_to_odom': LaunchConfiguration('alias_map_to_odom')},
+            ],
             condition=IfCondition(LaunchConfiguration('use_dwa_planner')),
+        ),
+        # 非 DWA 模式：中继 /scan -> /scan_for_costmap，使 costmap 正常工作
+        Node(
+            package='dwa_local_planner',
+            executable='scan_relay_node',
+            name='scan_relay',
+            output='screen',
+            parameters=[{'use_sim_time': LaunchConfiguration('use_sim_time')}],
+            condition=UnlessCondition(LaunchConfiguration('use_dwa_planner')),
         ),
     ])

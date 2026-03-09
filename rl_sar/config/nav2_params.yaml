@@ -4,9 +4,9 @@ bt_navigator:
     global_frame: map
     robot_base_frame: base_link
     odom_topic: /odom         
-    bt_loop_duration: 50
-    default_server_timeout: 3000
-    wait_for_service_timeout: 5000
+    bt_loop_duration: 100
+    default_server_timeout: 10000
+    wait_for_service_timeout: 15000
 
     plugin_lib_names:
       - nav2_compute_path_to_pose_action_bt_node
@@ -60,7 +60,7 @@ bt_navigator:
 controller_server:
   ros__parameters:
     use_sim_time: true
-    controller_frequency: 20.0
+    controller_frequency: 12.0
     odom_frame: odom
     base_frame_id: base_link
     global_frame: odom
@@ -122,15 +122,17 @@ global_costmap:
       resolution: 0.05
       footprint_padding: 0.03
 
+      # 无图模式：obstacle_layer 使用 /scan_for_costmap（DWA 模式下已过滤动态，消除轨迹拖影）
+      # 有图后改 plugins 为 ["static_layer", "inflation_layer"]，删除 obstacle_layer
       plugins: ["obstacle_layer", "inflation_layer"]
 
       obstacle_layer:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: true
-        observation_persistence: 0.2
-        observation_sources: scan
-        scan:
-          topic: /scan
+        observation_persistence: 0.03  # 进一步缩短，减少偶发小块拖影驻留
+        observation_sources: scan_for_costmap
+        scan_for_costmap:
+          topic: /scan_for_costmap
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -153,8 +155,8 @@ local_costmap:
       robot_base_frame: base_link
       robot_radius: 0.24
       rolling_window: true
-      update_frequency: 10.0
-      publish_frequency: 5.0
+      update_frequency: 6.0
+      publish_frequency: 3.0
       always_send_full_costmap: true
       width: 10
       height: 10
@@ -167,10 +169,10 @@ local_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         max_obstacle_height: 2.0
-        observation_persistence: 0.3
-        observation_sources: scan
-        scan:
-          topic: /scan
+        observation_persistence: 0.03  # 进一步缩短，减少偶发小块拖影驻留
+        observation_sources: scan_for_costmap
+        scan_for_costmap:
+          topic: /scan_for_costmap
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -178,13 +180,13 @@ local_costmap:
           raytrace_max_range: 6.0
           raytrace_min_range: 0.0
           obstacle_max_range: 5.0
-          obstacle_min_range: 0.20
+          obstacle_min_range: 0.30
 
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         enabled: true
-        inflation_radius: 0.70
-        cost_scaling_factor: 3.8
+        inflation_radius: 0.45
+        cost_scaling_factor: 4.5
 
 behavior_server:
   ros__parameters:
@@ -196,3 +198,12 @@ behavior_server:
       plugin: "nav2_behaviors/BackUp"
     wait:
       plugin: "nav2_behaviors/Wait"
+
+# ========== 有图时切换为静态 global_costmap ==========
+# 当 map_server 或 SLAM 发布 /map 后，将 global_costmap 的 plugins 改为：
+#   plugins: ["static_layer", "inflation_layer"]
+# 删除 obstacle_layer 配置块，新增：
+#   static_layer:
+#     plugin: "nav2_costmap_2d::StaticLayer"
+#     enabled: true
+#     map_topic: /map
