@@ -2,12 +2,15 @@
 """
 DWA (Dynamic Window Approach) 局部规划器
 
-算法：方向 + 障碍物 + 速度 三评分加权，动态窗口采样 (v,w)。
-参考 DWB 思路：长预测、障碍权重不宜过高、接近目标减速、大角度先转向。
-参数按本算法实际结构（仅有单一障碍项、差分驱动机理）调优。
+算法：方向 + 障碍物 + 速度 + 前瞻预测 四评分加权，动态窗口采样 (v,w)。
+- direction: 轨迹末端朝向目标
+- obstacle:  当前占据/膨胀（反应式绕行）
+- velocity:  速度偏好
+- predictive: 候选轨迹 vs 障碍未来轨迹的 TTC + 时空距离联合风险（前瞻式绕行）
 
+参考 DWB 思路：长预测、障碍权重不宜过高、接近目标减速、大角度先转向。
 作者：dong
-版本：1.0
+版本：2.0
 """
 
 import numpy as np
@@ -24,11 +27,11 @@ class DWAPlanner:
         动态窗口用 control_interval 内的 accel/decel 约束采样范围。
         """
         # 机器人物理参数：先保证“能动得起来”，再做细调
-        self.max_linear_speed = 1.0     # 最大线速度（小幅上调）
-        self.min_linear_speed = 0.0     # 最小线速度
+        self.max_linear_speed = 1.2     # 最大线速度（提升巡航上限）
+        self.min_linear_speed = 0.03    # 最小线速度（减少长时间零速犹豫）
         self.max_angular_speed = 2.2    # 最大角速度（增强绕障脱困能力）
         self.min_angular_speed = -2.2   # 最小角速度
-        self.max_linear_accel = 1.4     # 线加速度（提高提速能力）
+        self.max_linear_accel = 2.6     # 线加速度（提升起步/再加速能力）
         self.max_linear_decel = 1.2     # 线减速度
         self.max_angular_accel = 2.8    # 角加速度
         self.max_angular_decel = 2.8    # 角减速度
@@ -41,10 +44,14 @@ class DWAPlanner:
         self.velocity_samples = 6       # 线速度采样（进一步降算力）
         self.angular_samples = 20       # 角速度采样（提高大转角可行轨迹密度）
 
-        # 权重：优先“走起来”，避免在安全区域反复选择 v≈0
-        self.weight_direction = 0.32    # 方向
-        self.weight_obstacle = 0.20     # 障碍
-        self.weight_velocity = 0.48     # 速度
+        # 权重：direction + obstacle + velocity + predictive 四评分
+        self.weight_direction = 0.28    # 方向
+        self.weight_obstacle = 0.18     # 障碍（反应式，当前占据/膨胀）
+        self.weight_velocity = 0.40     # 速度（提升速度偏好）
+        self.weight_predictive = 0.22   # 前瞻预测（TTC + 时空距离）
+
+        # 前瞻预测输入：get_predictions() 返回的 list[dict]
+        self.predicted_obstacles = []
 
         # 当前状态
         self.current_linear_speed = 0.0
@@ -60,7 +67,7 @@ class DWAPlanner:
         # - hard_collision_radius: 绝对碰撞半径（硬约束）
         # - soft_safety_radius:   软风险半径（评分衰减起点）
         self.hard_collision_radius = 0.24
-        self.soft_safety_radius = 0.35
+        self.soft_safety_radius = 0.30
         self.robot_radius = self.hard_collision_radius
         self.scan_points = np.empty((0, 2), dtype=np.float32)
 
@@ -72,7 +79,11 @@ class DWAPlanner:
         self.debug_enabled = False       # 默认关闭，由 sac_dwa_node 设置
         self.last_debug = {}
 
-    def set_weights(self, direction=None, obstacle=None, velocity=None):
+        # 角速度平滑：抑制左右频繁切换导致的 zigzag
+        self._last_best_w = 0.0
+        self._w_smoothing_score_margin = 0.03   # 分数差在此内时优先延续上一帧方向
+
+    def set_weights(self, direction=None, obstacle=None, velocity=None, predictive=None):
         """动态设置DWA评分权重（用于SAC在线调参）"""
         if direction is not None:
             self.weight_direction = float(direction)
@@ -80,13 +91,21 @@ class DWAPlanner:
             self.weight_obstacle = float(obstacle)
         if velocity is not None:
             self.weight_velocity = float(velocity)
+        if predictive is not None:
+            self.weight_predictive = float(predictive)
 
         # 归一化，避免权重尺度漂移
-        total = self.weight_direction + self.weight_obstacle + self.weight_velocity
+        total = (self.weight_direction + self.weight_obstacle +
+                 self.weight_velocity + self.weight_predictive)
         if total > 1e-9:
             self.weight_direction /= total
             self.weight_obstacle /= total
             self.weight_velocity /= total
+            self.weight_predictive /= total
+
+    def update_predicted_obstacles(self, predictions):
+        """更新前瞻预测目标（来自 predictor.get_predictions()）"""
+        self.predicted_obstacles = list(predictions) if predictions else []
 
     def set_debug(self, enabled: bool):
         """设置调试开关"""
@@ -269,14 +288,18 @@ class DWAPlanner:
             return 0.0
         map_available = self.map is not None
         scan_available = self.scan_points.shape[0] > 0
+        # 实时传感器优先：costmap 在动态场景下容易残留，导致“前方空旷也停住”。
+        # 当 scan/pointcloud 可用时，障碍评分以实时点云为主；仅在无实时点时回退到 costmap。
+        use_map_for_obstacle = map_available and not scan_available
         if not map_available and not scan_available:
-            # 地图与激光都不可用时保守处理，避免“盲目前进”
-            return 0.0
+            # 短时感知空窗不应把全部轨迹直接判死，否则会出现“空旷也走走停停”。
+            # 真正硬碰撞仍由后续帧的 scan/map 与 is_collision_point() 约束。
+            return 0.65
 
         # 仅保留“碰撞 + 最近障碍距离”两类核心判断
         min_distance = float('inf')
         found_obstacle = False
-        
+
         # 下采样轨迹点评价，避免高频大负载
         sampled_traj = trajectory[::2] if len(trajectory) > 2 else trajectory
         for x, y in sampled_traj:
@@ -284,12 +307,12 @@ class DWAPlanner:
             if self.is_collision_point(x, y):
                 return 0.0
 
-            d_map, cell_cost = self.get_distance_to_obstacle_from_map(x, y) if map_available else (None, None)
-            # 优先信任 costmap（已融合/滤波）；scan 距离仅在 map 不可用时兜底，
-            # 避免“附近任意方向有点云”导致 min-distance 过小而提前停滞
-            d = d_map
-            if d is None and scan_available:
+            d = None
+            if scan_available:
                 d = self.get_distance_to_obstacle_from_scan(x, y)
+            elif use_map_for_obstacle:
+                d_map, _ = self.get_distance_to_obstacle_from_map(x, y)
+                d = d_map
 
             if d is not None:  # 找到了障碍物
                 found_obstacle = True
@@ -302,7 +325,9 @@ class DWAPlanner:
 
         d_safe = self.soft_safety_radius   # 软风险半径（与硬碰撞半径分离）
         d_max = 1.5     # 超出视为安全 (m)
-        
+
+        # 近障碍段采用“软衰减”而非直接归零，避免几何可通过却被整体判死
+        # 真实硬碰撞仍由 is_collision_point() + hard_collision_radius 负责。
         if min_distance <= d_safe:
             return 0.0  # 距离太近，评分为0
         elif min_distance >= d_max:
@@ -312,7 +337,7 @@ class DWAPlanner:
             return float(np.clip(score, 0.0, 1.0))
 
     def is_collision_point(self, x, y):
-        """按机器人半径检查该点是否碰撞或进入不可接受高代价区域。"""
+        """按机器人半径检查该点是否碰撞或进入不可接受高代价区域（当前占据/膨胀）。"""
         if self.map is None:
             d_scan = self.get_distance_to_obstacle_from_scan(x, y)
             if d_scan is None:
@@ -320,7 +345,12 @@ class DWAPlanner:
             return d_scan <= self.robot_radius
         map_x, map_y = self.world_to_map(x, y)
         if not (0 <= map_x < self.map.shape[1] and 0 <= map_y < self.map.shape[0]):
-            return True
+            # 轨迹点超出局部 costmap 边界时，优先回退到实时 scan 判断；
+            # 避免 rolling window 边缘把整组轨迹误判为碰撞。
+            d_scan = self.get_distance_to_obstacle_from_scan(x, y)
+            if d_scan is not None:
+                return d_scan <= self.robot_radius
+            return False
 
         radius_cells = max(1, int(self.robot_radius / max(self.map_resolution, 1e-6)))
         # 仅将接近致命代价判为碰撞（100制地图下用 98，减少“边缘误碰撞”）
@@ -341,11 +371,12 @@ class DWAPlanner:
         return False
 
     def get_distance_to_obstacle_from_scan(self, x, y):
-        """使用激光障碍点计算预测点到障碍物的最近距离。"""
-        if self.scan_points.shape[0] == 0:
+        """使用激光/点云障碍点计算到障碍物的最近距离。obstacle 评分仅用当前占据（反应式）。"""
+        pts = self.scan_points
+        if pts.shape[0] == 0:
             return None
-        dx = self.scan_points[:, 0] - float(x)
-        dy = self.scan_points[:, 1] - float(y)
+        dx = pts[:, 0] - float(x)
+        dy = pts[:, 1] - float(y)
         d2 = dx * dx + dy * dy
         return float(math.sqrt(float(np.min(d2))))
 
@@ -397,6 +428,131 @@ class DWAPlanner:
         velocity_score = abs(v)
         return velocity_score / self.max_linear_speed
 
+    def calculate_predictive_score(self, trajectory, v, w):
+        """
+        前瞻预测评分：TTC + 时空距离联合风险。
+        候选轨迹 vs 障碍未来轨迹的时空对准比较，低 TTC 或近距离 = 高风险 = 低分。
+        并加入“前后通行”偏好：在侧向交汇时，优先选择从动态障碍物后方通过（让后）。
+        """
+        if not trajectory or not self.predicted_obstacles or self.current_pose is None:
+            return 1.0  # 无预测目标时给满分
+
+        theta0 = self.get_robot_current_angle()
+        dt = self.control_interval
+        d_safe = self.soft_safety_radius
+        ttc_safe = 2.5   # TTC > 2.5s 视为安全（提前规避横穿）
+        vo_horizon = min(3.0, max(1.2, self.predict_time))
+
+        min_d = float('inf')
+        min_ttc = float('inf')
+        has_dynamic_risk = False
+        ahead_risk_raw = 0.0   # 机器人位于动态障碍“前方”且接近时的风险
+        behind_bonus_raw = 0.0 # 机器人位于动态障碍“后方”且接近时的奖励
+        vo_hard_collision = False
+        vo_risk_raw = 0.0
+
+        for pred in self.predicted_obstacles:
+            pos_xy = pred.get("position_xy", (0, 0))
+            vel_xy = pred.get("velocity_xy", (0, 0))
+            future_xy = pred.get("future_xy", [])
+            vox, voy = vel_xy[0], vel_xy[1]
+            obs_speed = math.hypot(vox, voy)
+            # 预测评分只关注“明显动态”目标，避免与 obstacle_score 对静态障碍重复惩罚
+            if obs_speed < 0.05:
+                continue
+            uox, uoy = vox / obs_speed, voy / obs_speed
+
+            for i, (xr, yr) in enumerate(trajectory):
+                t_i = i * dt
+                theta_i = theta0 + w * t_i
+                vr_x = v * math.cos(theta_i)
+                vr_y = v * math.sin(theta_i)
+
+                if i == 0:
+                    xo, yo = pos_xy[0], pos_xy[1]
+                elif i - 1 < len(future_xy):
+                    xo, yo = future_xy[i - 1][0], future_xy[i - 1][1]
+                else:
+                    continue
+
+                dx = xr - xo
+                dy = yr - yo
+                d = math.sqrt(dx * dx + dy * dy)
+                if d < min_d:
+                    min_d = d
+
+                # RVO2/ORCA 思想（时序 VO 判别）：
+                # 在每个轨迹时刻使用相对位姿/相对速度，检查剩余时间窗内是否进入碰撞圆
+                obs_r = float(pred.get("inflation_radius", 0.25))
+                R = self.robot_radius + max(0.15, obs_r)
+                if d <= R:
+                    vo_hard_collision = True
+                    has_dynamic_risk = True
+                else:
+                    horizon_remain = vo_horizon - t_i
+                    if horizon_remain > 0.0:
+                        urx = vr_x - vox
+                        ury = vr_y - voy
+                        a = urx * urx + ury * ury
+                        b = 2.0 * (dx * urx + dy * ury)
+                        c = dx * dx + dy * dy - R * R
+                        if a > 1e-8:
+                            disc = b * b - 4.0 * a * c
+                            if disc >= 0.0:
+                                sqrt_disc = math.sqrt(disc)
+                                t_enter = (-b - sqrt_disc) / (2.0 * a)
+                                t_exit = (-b + sqrt_disc) / (2.0 * a)
+                                if t_exit >= 0.0 and t_enter <= horizon_remain:
+                                    ttc_vo = max(0.0, t_enter)
+                                    vo_risk_raw = max(vo_risk_raw, 1.0 / (0.2 + ttc_vo))
+                                    has_dynamic_risk = True
+                                    if ttc_vo < 0.8:
+                                        vo_hard_collision = True
+
+                # “让前/让后”判据：
+                # s_along > 0: 机器人在障碍速度方向前方（更容易迎面交汇/切前）
+                # s_along < 0: 机器人在障碍后方（更安全，鼓励后绕）
+                if d < 1.6:
+                    s_along = dx * uox + dy * uoy
+                    proximity = 1.0 / (d + 0.25)
+                    if s_along > 0.0:
+                        ahead_risk_raw = max(ahead_risk_raw, s_along * proximity)
+                    else:
+                        behind_bonus_raw = max(behind_bonus_raw, (-s_along) * proximity)
+
+                if d < 1e-6:
+                    min_ttc = 0.0
+                    continue
+
+                v_rel_x = vr_x - vox
+                v_rel_y = vr_y - voy
+                v_closing = -(dx * v_rel_x + dy * v_rel_y) / d
+                if v_closing > 0.01:
+                    has_dynamic_risk = True
+                    ttc = d / v_closing
+                    if ttc < min_ttc:
+                        min_ttc = ttc
+
+        if not has_dynamic_risk:
+            return 1.0
+
+        if vo_hard_collision:
+            return 0.0
+
+        if min_ttc == float('inf'):
+            min_ttc = 10.0
+
+        risk_ttc = 1.0 / (1.0 + min_ttc) if min_ttc < ttc_safe else 0.0
+        risk_d = math.exp(-min_d / max(d_safe, 0.1)) if min_d < 1.8 else 0.0
+        # 归一化“切前风险/后绕奖励”
+        ahead_risk = math.tanh(ahead_risk_raw)
+        behind_bonus = math.tanh(behind_bonus_raw)
+        vo_risk = math.tanh(vo_risk_raw)
+
+        # 横穿场景：VO/TTC 主导，同时显式惩罚“切前”，鼓励“后绕”
+        risk = 0.42 * risk_ttc + 0.18 * risk_d + 0.15 * ahead_risk + 0.25 * vo_risk
+        score = 1.0 - min(risk, 1.0) + 0.15 * behind_bonus
+        return float(np.clip(score, 0.0, 1.0))
 
     # ============ 搜索最佳速度组合 ============
 
@@ -419,34 +575,55 @@ class DWAPlanner:
         direction_scores = []
         obstacle_scores = []
         velocity_scores = []
+        predictive_scores = []
 
         for v in v_samples:
             for w in w_samples:
                 traj = self.predict_trajectory(v, w, self.predict_time)
-                
+
                 direction_score = self.calculate_direction_score(traj, v, w)
                 obstacle_score = self.calculate_obstacle_score(traj)
                 velocity_score = self.calculate_speed_score(v)
-                
+                predictive_score = self.calculate_predictive_score(traj, v, w)
+
                 trajectories_data.append((v, w, traj))
                 direction_scores.append(direction_score)
                 obstacle_scores.append(obstacle_score)
                 velocity_scores.append(velocity_score)
+                predictive_scores.append(predictive_score)
 
         best_score = float('-inf')
         best_v, best_w = 0.0, 0.0
         feasible_count = 0
 
+        totals = np.zeros(len(trajectories_data), dtype=np.float64)
         for i, (v, w, traj) in enumerate(trajectories_data):
-            total_score = (self.weight_direction * direction_scores[i] + 
-                          self.weight_obstacle * obstacle_scores[i] + 
-                          self.weight_velocity * velocity_scores[i])
-                
-            if total_score > best_score:
-                best_score, best_v, best_w = total_score, v, w
+            totals[i] = (
+                self.weight_direction * direction_scores[i] +
+                self.weight_obstacle * obstacle_scores[i] +
+                self.weight_velocity * velocity_scores[i] +
+                self.weight_predictive * predictive_scores[i]
+            )
+            # 真实可行性：
+            # - obstacle_score=0 仍视为不可行（接近硬碰撞）
+            # - predictive_score=0 仅在存在明显前进速度时判不可行，允许原地转向先脱困
+            pred_blocked = predictive_scores[i] <= 1e-6 and abs(v) > 0.06
+            if obstacle_scores[i] <= 1e-6 or pred_blocked:
+                totals[i] = -1e9
+                continue
+            if totals[i] > best_score:
+                best_score, best_v, best_w = totals[i], v, w
             feasible_count += 1
 
-        # 没有可行前进轨迹时，原地朝目标慢速转向，等待新的可行窗口
+        # 角速度平滑：若最优与上一帧方向相反且分数接近，优先延续上一帧方向
+        if feasible_count > 0 and (best_w * self._last_best_w) < 0:
+            for i, (v, w, _) in enumerate(trajectories_data):
+                if (w * self._last_best_w) >= 0 and totals[i] >= best_score - self._w_smoothing_score_margin:
+                    best_v, best_w = v, w
+                    break
+        self._last_best_w = best_w
+
+        # 没有可行前进轨迹时，原地朝目标慢速转向
         if feasible_count == 0:
             if self.current_pose is None:
                 self.last_debug = {
@@ -462,6 +639,7 @@ class DWAPlanner:
             cur_heading = self.quaternion_to_yaw(self.current_pose.orientation)
             err = self.normalize_angle(goal_heading - cur_heading)
             w = max(-0.7, min(0.7, 1.2 * err))
+            self._last_best_w = w
             self.last_debug = {
                 "status": "no_feasible_rotate",
                 "best_v": 0.0,
@@ -475,6 +653,14 @@ class DWAPlanner:
         forced_min_progress = False
 
         obs_arr = np.asarray(obstacle_scores, dtype=np.float32)
+        pred_arr = np.asarray(predictive_scores, dtype=np.float32)
+        totals = (
+            self.weight_direction * np.asarray(direction_scores, dtype=np.float32) +
+            self.weight_obstacle * np.asarray(obstacle_scores, dtype=np.float32) +
+            self.weight_velocity * np.asarray(velocity_scores, dtype=np.float32) +
+            self.weight_predictive * pred_arr
+        )
+        best_idx = int(np.argmax(totals))
         self.last_debug = {
             "status": "ok",
             "best_v": float(best_v),
@@ -483,11 +669,11 @@ class DWAPlanner:
             "feasible_count": int(feasible_count),
             "obs_min": float(np.min(obs_arr)) if obs_arr.size > 0 else 0.0,
             "obs_max": float(np.max(obs_arr)) if obs_arr.size > 0 else 0.0,
-            "obs_best": float(obs_arr[int(np.argmax(
-                self.weight_direction * np.asarray(direction_scores, dtype=np.float32) +
-                self.weight_obstacle * np.asarray(obstacle_scores, dtype=np.float32) +
-                self.weight_velocity * np.asarray(velocity_scores, dtype=np.float32)
-            ))]) if obs_arr.size > 0 else 0.0,
+            "obs_best": float(obs_arr[best_idx]) if obs_arr.size > 0 else 0.0,
+            "pred_cnt": len(self.predicted_obstacles),
+            "pred_min": float(np.min(pred_arr)) if pred_arr.size > 0 else 1.0,
+            "pred_max": float(np.max(pred_arr)) if pred_arr.size > 0 else 1.0,
+            "pred_best": float(pred_arr[best_idx]) if pred_arr.size > 0 else 1.0,
             "forced_min_progress": bool(forced_min_progress),
         }
 
