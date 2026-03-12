@@ -21,6 +21,8 @@ setup(
         'console_scripts': [
             'sac_dwa_node = dwa_local_planner.sac_dwa_node:main',
             'scan_filter_node = dwa_local_planner.scan_filter_node:main',
+            # 动态/静态障碍物预测 GUI，可视化 SAC-DWA 在决策前一刻的环境评估
+            'dwa_prediction_gui = dwa_local_planner.gui.prediction_gui:main',
         ],
     },
 )
