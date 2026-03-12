@@ -20,6 +20,7 @@ setup(
     entry_points={
         'console_scripts': [
             'sac_dwa_node = dwa_local_planner.sac_dwa_node:main',
+            'scan_filter_node = dwa_local_planner.scan_filter_node:main',
         ],
     },
 )

@@ -15,9 +15,16 @@ from ament_index_python.packages import get_package_share_directory
 os.environ['QT_QPA_PLATFORM'] = 'xcb'  # 强制使用 X11
 os.environ['GDK_BACKEND'] = 'x11'
 
+# PedestrianSFMPlugin 路径（移动行人插件）
+_SFM_PLUGIN_DIR = os.path.expanduser("~/222/world/gazebo_sfm_plugin-master")
+if os.path.exists(_SFM_PLUGIN_DIR):
+    _current = os.environ.get("GAZEBO_PLUGIN_PATH", "")
+    os.environ["GAZEBO_PLUGIN_PATH"] = f"{_SFM_PLUGIN_DIR}:{_current}" if _current else _SFM_PLUGIN_DIR
+
 
 def generate_launch_description():
     rname = LaunchConfiguration("rname")
+    world_file = LaunchConfiguration("world")
     spawn_x = LaunchConfiguration("spawn_x")
     spawn_y = LaunchConfiguration("spawn_y")
     spawn_z = LaunchConfiguration("spawn_z")
@@ -53,8 +60,7 @@ def generate_launch_description():
             "verbose": "true",
             "pause": "false",
             "gui": "true",  # 显式启用 GUI
-            # 使用用户自定义的世界文件（0404.world）
-            "world": "/home/tjx/222/0404.world",
+            "world": world_file,
         }.items(),
     )
     spawn_entity = TimerAction(
@@ -131,6 +137,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
+        DeclareLaunchArgument(
+            "world",
+            default_value=os.path.expanduser("~/222/world/0404.world"),
+            description="World file path. 默认 ~/222/world/0404.world",
+        ),
         DeclareLaunchArgument(
             "rname",
             description="Robot name (e.g., a1, go2, b2)",

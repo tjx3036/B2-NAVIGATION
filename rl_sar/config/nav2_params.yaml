@@ -114,6 +114,7 @@ global_costmap:
       robot_base_frame: base_link
       robot_radius: 0.24
       rolling_window: false
+      transform_tolerance: 0.5
 
       origin_x: -20.0    # 扩展以包含机器人初始位置 (0,0) 及传感器 (-0.49, 1.60)
       origin_y: -50.0
@@ -153,13 +154,14 @@ local_costmap:
       robot_base_frame: base_link
       robot_radius: 0.24
       rolling_window: true
-      update_frequency: 10.0
-      publish_frequency: 5.0
+      update_frequency: 15.0
+      publish_frequency: 10.0
       always_send_full_costmap: true
       width: 10
       height: 10
       resolution: 0.05
       footprint_padding: 0.03
+      transform_tolerance: 0.5
 
       plugins: ["obstacle_layer", "inflation_layer"]
 
@@ -167,7 +169,7 @@ local_costmap:
         plugin: "nav2_costmap_2d::ObstacleLayer"
         enabled: True
         max_obstacle_height: 2.0
-        observation_persistence: 0.3
+        observation_persistence: 0.2
         observation_sources: scan
         scan:
           topic: /scan

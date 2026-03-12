@@ -1,0 +1,20 @@
+# 覆盖 nav2_params.yaml 中的 scan topic，使 costmap 使用过滤后的 scan（去除动态障碍物）
+# 与 use_dynamic_scan_filter:=true 配合使用
+#
+# 若膨胀带与实际障碍位置仍有偏差，可尝试：
+# - 提高 resolution（如 0.025）减少量化误差，但会增加计算量
+# - 检查 TF 树：ros2 run tf2_tools view_frames
+# - 确认 RViz 的 Fixed Frame 与 costmap 的 global_frame 一致（local 为 odom）
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      obstacle_layer:
+        scan:
+          topic: /scan_filtered
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      obstacle_layer:
+        scan:
+          topic: /scan_filtered
