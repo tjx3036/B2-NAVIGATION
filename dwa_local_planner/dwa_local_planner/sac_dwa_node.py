@@ -33,6 +33,7 @@ from nav_msgs.msg import Odometry, OccupancyGrid, Path
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Float32MultiArray
 from tf2_ros import TransformBroadcaster, Buffer, TransformListener
 
 from dwa_local_planner.dwa_planner import DWAPlanner
@@ -112,6 +113,9 @@ class SACDWANode(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
+        # 最近一次用于 DWA 的“纯静态障碍点”，供 GUI 直接读取算法内部动静分离结果
+        self._last_static_pts = np.empty((0, 2), dtype=np.float32)
+
         self.sub_odom = self.create_subscription(
             Odometry, "/odom", self.on_odom, 20, callback_group=self._ctrl_group
         )
@@ -134,6 +138,9 @@ class SACDWANode(Node):
         self.pub_cmd = self.create_publisher(Twist, "/cmd_vel", 20)
         self.pub_odom = self.create_publisher(Odometry, "/odom", 20)
         self.pub_scan_for_costmap = self.create_publisher(LaserScan, "/scan_for_costmap", 10)
+        # 仅用于可视化/调试：发布 DWA 内部的动态/静态障碍物信息
+        self.pub_dynamic_info = self.create_publisher(Float32MultiArray, "/dwa_dynamic_obstacles_info", 10)
+        self.pub_static_info = self.create_publisher(Float32MultiArray, "/dwa_static_obstacles_info", 10)
         self.tf_broadcaster = TransformBroadcaster(self)
         self.timer = self.create_timer(1.0 / self.control_hz, self.on_timer, callback_group=self._ctrl_group)
         self.follow_path_server = ActionServer(
@@ -457,15 +464,24 @@ class SACDWANode(Node):
             pts = scan_pts
 
         if pts.shape[0] > 0:
-            self.obstacle_predictor.update(pts, timestamp=timestamp if timestamp is not None else self._now_ros_time())
+            self.obstacle_predictor.update(
+                pts, timestamp=timestamp if timestamp is not None else self._now_ros_time()
+            )
             dynamic_centroids = self.obstacle_predictor.get_dynamic_centroids(min_speed=0.05)
             static_pts, _ = separate_dynamic_static_points(
                 pts, dynamic_centroids, exclude_radius=self.dynamic_exclude_radius
             )
+            # 缓存算法内部真正用于 DWA 的“静态障碍点”，GUI 直接可视化这一份
+            self._last_static_pts = (
+                static_pts.astype(np.float32) if static_pts is not None else np.empty((0, 2), dtype=np.float32)
+            )
             self.planner.update_scan_points(static_pts)
         else:
+            self._last_static_pts = np.empty((0, 2), dtype=np.float32)
             self.planner.update_scan_points(None)
-            self.obstacle_predictor.update(None, timestamp=timestamp if timestamp is not None else self._now_ros_time())
+            self.obstacle_predictor.update(
+                None, timestamp=timestamp if timestamp is not None else self._now_ros_time()
+            )
 
     def _ros_time_to_float(self, stamp) -> float:
         """将 ROS Time 转为 float 秒，用于预测器时间对准"""
@@ -627,8 +643,11 @@ class SACDWANode(Node):
                     self._last_diag_log_t = now_t
                 return
 
-        # 每个控制周期刷新一次障碍输入，及时淘汰陈旧点云/激光数据。
-        self._push_obstacle_points_to_planner(timestamp=self._now_ros_time())
+        # 仅用上次动静分离结果刷新 planner 的障碍点；预测器只在 on_scan/on_points 里更新，
+        # 避免定时器用同一份缓存点云+新时间戳反复 update，导致多帧回归速度被冲成 0、停下后无法跟踪动态目标。
+        self.planner.update_scan_points(
+            self._last_static_pts if self._last_static_pts.size > 0 else None
+        )
 
         # costmap 过期时清空地图输入，避免历史障碍残留长期压低 obstacle_score。
         if (time.monotonic() - self._last_costmap_t) > self.costmap_timeout_s:
@@ -717,10 +736,35 @@ class SACDWANode(Node):
             predict_time=self.planner.predict_time,
             dt_step=self.planner.control_interval,
             range_origin_xy=range_origin,
-            max_range=4.0,
+            max_range=8.0,
             max_preds=30,
         )
         preds = self.trail_filter.filter_predictions(preds)
+        # 在更新 planner / 生成速度命令之前，将这一刻的预测结果和静态障碍点发布出去，
+        # 供 GUI 节点直接展示“算法真实使用的动/静态障碍物”。
+        try:
+            dyn_msg = Float32MultiArray()
+            dyn_data = []
+            for p in preds:
+                pos = p.get("position_xy", (0.0, 0.0))
+                vel = p.get("velocity_xy", (0.0, 0.0))
+                vx = float(vel[0])
+                vy = float(vel[1])
+                speed = math.hypot(vx, vy)
+                dyn_data.extend([float(pos[0]), float(pos[1]), vx, vy, speed])
+            dyn_msg.data = dyn_data
+            self.pub_dynamic_info.publish(dyn_msg)
+
+            static_msg = Float32MultiArray()
+            if self._last_static_pts is not None and self._last_static_pts.size > 0:
+                static_msg.data = self._last_static_pts.astype(np.float32).ravel().tolist()
+            else:
+                static_msg.data = []
+            self.pub_static_info.publish(static_msg)
+        except Exception:
+            # 可视化信息发布失败不影响控制主循环
+            pass
+
         self.planner.update_predicted_obstacles(preds)
         self._update_adaptive_weights(pred_count=len(preds))
 

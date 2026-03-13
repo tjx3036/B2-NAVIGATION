@@ -70,14 +70,14 @@ controller_server:
 
     progress_checker:
       plugin: "nav2_controller::SimpleProgressChecker"
-      required_movement_radius: 0.20    # 放宽：DWA 较慢时 10s 内移动 0.2m 即视为有进度
-      movement_time_allowance: 15.0   # 放宽：超时时间 15s
+      required_movement_radius: 0.10    # 更宽松：10s 内移动 0.1m 即视为有进度，避免到点附近频繁触发恢复
+      movement_time_allowance: 20.0     # 放宽：超时时间 20s，减小靠近终点时频繁重规划
 
     goal_checker:
       plugin: "nav2_controller::SimpleGoalChecker"
-      xy_goal_tolerance: 0.30
-      yaw_goal_tolerance: 0.30
-      stateful: True
+      xy_goal_tolerance: 0.40        # 提高位置容差：机器人距离目标 40cm 以内即视为到达
+      yaw_goal_tolerance: 0.40       # 提高朝向容差：约 23 度以内不再持续微调，减少绕圈
+      stateful: True                 # 一旦判定到达后，不会因为轻微抖动又变成“未到达”
 
     FollowPath:
       plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"

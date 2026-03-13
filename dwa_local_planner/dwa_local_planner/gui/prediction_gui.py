@@ -22,6 +22,7 @@ from nav_msgs.msg import Odometry
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan, PointCloud2
 from sensor_msgs_py import point_cloud2
+from std_msgs.msg import Float32MultiArray
 from tf2_ros import Buffer, TransformListener
 
 from dwa_local_planner.obstacle_predictor import ObstaclePredictor
@@ -43,9 +44,11 @@ class PredictionGuiNode(Node):
         # 世界坐标系下的线速度向量 (vx, vy)，用于显示“实际移动方向”
         self.robot_vel_world = np.array([0.0, 0.0], dtype=np.float32)
 
-        # GUI 用的障碍数据（完全独立于控制节点）
+        # GUI 用的障碍数据（默认来自 SAC-DWA 节点的 debug 话题，若缺失再本地推断）
         self.dynamic_obstacles: List[Tuple[float, float, float, float, float]] = []
         self.static_points: np.ndarray = np.empty((0, 2), dtype=np.float32)
+        self._dynamic_from_node: List[Tuple[float, float, float, float, float]] = []
+        self._static_from_node: np.ndarray = np.empty((0, 2), dtype=np.float32)
 
         # 时间戳
         self.last_dyn_stamp = 0.0
@@ -106,9 +109,18 @@ class PredictionGuiNode(Node):
             PointCloud2, "/velodyne_points", self.on_points, 10
         )
 
+        # 直接订阅 SAC-DWA 提供的 debug 动/静态障碍物话题，优先使用算法内部结果
+        self.sub_dyn_info = self.create_subscription(
+            Float32MultiArray, "/dwa_dynamic_obstacles_info", self.on_dynamic_info_from_node, 10
+        )
+        self.sub_static_info = self.create_subscription(
+            Float32MultiArray, "/dwa_static_obstacles_info", self.on_static_info_from_node, 10
+        )
+
         self.get_logger().info(
             "DWA prediction GUI (pure listener) started. "
-            "Subscribed to /odom, /gazebo/model_states, /scan, /velodyne_points."
+            "Subscribed to /odom, /gazebo/model_states, /scan, /velodyne_points, "
+            "/dwa_dynamic_obstacles_info, /dwa_static_obstacles_info."
         )
 
     # ========= ROS 回调 =========
@@ -167,6 +179,33 @@ class PredictionGuiNode(Node):
             self.robot_vel_world[0] = vx_w
             self.robot_vel_world[1] = vy_w
             self.last_odom_stamp = time.monotonic()
+
+    # ========= 从 SAC-DWA 节点读取动/静态障碍物（算法真实使用的数据） =========
+
+    def on_dynamic_info_from_node(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        dyn_list: List[Tuple[float, float, float, float, float]] = []
+        if len(data) >= 5:
+            n = len(data) // 5
+            for i in range(n):
+                x, y, vx, vy, spd = data[5 * i : 5 * i + 5]
+                dyn_list.append(
+                    (float(x), float(y), float(vx), float(vy), float(spd))
+                )
+        with self._lock:
+            self._dynamic_from_node = dyn_list
+            self.last_dyn_stamp = time.monotonic()
+
+    def on_static_info_from_node(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        pts = np.empty((0, 2), dtype=np.float32)
+        if len(data) >= 2:
+            n = len(data) // 2
+            arr = np.asarray(data[: 2 * n], dtype=np.float32).reshape((-1, 2))
+            pts = arr
+        with self._lock:
+            self._static_from_node = pts
+            self.last_static_stamp = time.monotonic()
 
     def get_robot_pose_tf(self) -> Optional[Tuple[float, float, float]]:
         """
@@ -352,14 +391,21 @@ class PredictionGuiNode(Node):
     def snapshot(self):
         """返回当前状态快照，供绘图线程使用。"""
         with self._lock:
+            # 优先使用 SAC-DWA 节点发布的动/静态障碍物（算法真实使用的结果）
+            dyn = list(self._dynamic_from_node) if self._dynamic_from_node else list(self.dynamic_obstacles)
+            static = (
+                self._static_from_node.copy()
+                if self._static_from_node is not None and self._static_from_node.size > 0
+                else self.static_points.copy()
+            )
             return (
                 self.robot_pos.copy(),
                 float(self.robot_yaw),
                 float(self.robot_lin_speed),
                 float(self.robot_ang_speed),
                 self.robot_vel_world.copy(),
-                list(self.dynamic_obstacles),
-                self.static_points.copy(),
+                dyn,
+                static,
                 float(self.last_odom_stamp),
                 float(self.last_dyn_stamp),
                 float(self.last_static_stamp),
@@ -408,10 +454,7 @@ def run_matplotlib_gui(node: PredictionGuiNode):
 
     robot_vel_quiver = None
     dyn_quiver = None
-
-    # 固定一个“世界坐标视窗”，而不是每帧都以机器人为中心
-    center_x = None
-    center_y = None
+    dyn_speed_texts = []
 
     while rclpy.ok():
         (
@@ -436,8 +479,8 @@ def run_matplotlib_gui(node: PredictionGuiNode):
         else:
             rx, ry = robot_pos[0], robot_pos[1]
         robot_scatter.set_offsets(np.array([[rx, ry]], dtype=np.float32))
-        # 1) 机器人机体朝向（蓝色箭头）
-        heading_len = 0.8
+        # 1) 机器人机体朝向（蓝色箭头）——长度加大，便于在大范围视图中看到
+        heading_len = 2.0
         rvx = heading_len * math.cos(robot_yaw)
         rvy = heading_len * math.sin(robot_yaw)
         if robot_vel_quiver is not None:
@@ -453,27 +496,15 @@ def run_matplotlib_gui(node: PredictionGuiNode):
             angles="xy",
         )
 
-        # 2) 实际移动方向（世界系线速度，绿色箭头）
-        mvx, mvy = float(robot_vel_world[0]), float(robot_vel_world[1])
-        move_speed = math.hypot(mvx, mvy)
-        if move_speed > 1e-3:
-            scale = max(0.8, min(2.0, move_speed))
-            mvx_draw = mvx / (move_speed + 1e-6) * scale
-            mvy_draw = mvy / (move_speed + 1e-6) * scale
-            move_quiver = ax.quiver(
-                [rx],
-                [ry],
-                [mvx_draw],
-                [mvy_draw],
-                color="green",
-                scale=1,
-                scale_units="xy",
-                angles="xy",
-            )
-        else:
-            move_quiver = None
+        # 2) 实际移动方向（世界系线速度）在当前版本的 GUI 中不再单独以绿色箭头显示，
+        # 以避免与机体朝向混淆；如需恢复，只需重新绘制基于 robot_vel_world 的箭头。
 
         # 动态障碍物
+        # 先清除上一次的速度文本
+        for txt in dyn_speed_texts:
+            txt.remove()
+        dyn_speed_texts = []
+
         if dyn_list:
             dyn_xy = np.array([[d[0], d[1]] for d in dyn_list], dtype=np.float32)
             dyn_v = np.array([[d[2], d[3]] for d in dyn_list], dtype=np.float32)
@@ -490,6 +521,18 @@ def run_matplotlib_gui(node: PredictionGuiNode):
                 scale_units="xy",
                 angles="xy",
             )
+            # 为每个动态障碍物添加速度文本标注（字体稍大并略微偏移，避免被点遮挡）
+            for (x, y, _, _, spd) in dyn_list:
+                txt = ax.text(
+                    x + 0.3,
+                    y + 0.3,
+                    f"{spd:.2f} m/s",
+                    color="red",
+                    fontsize=9,
+                    ha="left",
+                    va="bottom",
+                )
+                dyn_speed_texts.append(txt)
         else:
             dyn_scatter.set_offsets(np.empty((0, 2)))
             if dyn_quiver is not None:
@@ -502,13 +545,10 @@ def run_matplotlib_gui(node: PredictionGuiNode):
         else:
             static_scatter.set_offsets(np.empty((0, 2)))
 
-        # 视野：使用第一次收到的机器人位姿作为“世界坐标窗口中心”，
-        # 后续不再跟随机器人移动，这样可以直观看到机器人在世界中的平移。
-        if center_x is None or center_y is None:
-            center_x, center_y = float(rx), float(ry)
-        view_radius = 10.0
-        ax.set_xlim(center_x - view_radius, center_x + view_radius)
-        ax.set_ylim(center_y - view_radius, center_y + view_radius)
+        # 视野始终以机器人当前位置为中心，并进一步扩大范围
+        view_radius = 30.0
+        ax.set_xlim(float(rx) - view_radius, float(rx) + view_radius)
+        ax.set_ylim(float(ry) - view_radius, float(ry) + view_radius)
 
         # 文本信息
         dyn_count = len(dyn_list)

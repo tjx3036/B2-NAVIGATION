@@ -86,7 +86,9 @@ def generate_launch_description():
             output='screen',
             parameters=[params_file, params_filtered, {'use_sim_time': LaunchConfiguration('use_sim_time')}]
         ),
-        # Controller in normal Nav2 mode (without custom DWA)
+        # Controller in DWA mode: keep Nav2 controller for costmaps & recovery.
+        # NOTE: Do NOT remap FollowPath action here, otherwise bt_navigator
+        #       cannot find the 'follow_path' action server and bringup fails.
         Node(
             package='nav2_controller',
             executable='controller_server',
@@ -96,17 +98,6 @@ def generate_launch_description():
             remappings=[
                 ('/cmd_vel', '/nav2_cmd_vel'),
                 ('cmd_vel', 'nav2_cmd_vel'),
-                # Remap all FollowPath action endpoints to avoid /follow_path conflict
-                ('/follow_path/_action/send_goal', '/nav2_follow_path/_action/send_goal'),
-                ('/follow_path/_action/get_result', '/nav2_follow_path/_action/get_result'),
-                ('/follow_path/_action/cancel_goal', '/nav2_follow_path/_action/cancel_goal'),
-                ('/follow_path/_action/feedback', '/nav2_follow_path/_action/feedback'),
-                ('/follow_path/_action/status', '/nav2_follow_path/_action/status'),
-                ('follow_path/_action/send_goal', 'nav2_follow_path/_action/send_goal'),
-                ('follow_path/_action/get_result', 'nav2_follow_path/_action/get_result'),
-                ('follow_path/_action/cancel_goal', 'nav2_follow_path/_action/cancel_goal'),
-                ('follow_path/_action/feedback', 'nav2_follow_path/_action/feedback'),
-                ('follow_path/_action/status', 'nav2_follow_path/_action/status'),
             ],
             condition=IfCondition(LaunchConfiguration('use_dwa_planner'))
         ),
