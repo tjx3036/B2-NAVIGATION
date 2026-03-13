@@ -55,7 +55,7 @@ class PredictionGuiNode(Node):
         self.last_static_stamp = 0.0
         self.last_odom_stamp = 0.0
 
-        # 与 sac_dwa_node 保持一致的预测器配置
+        # 与 sac_dwa_node 保持一致的预测器配置（仅用于本地 fallback，不影响真实算法）
         self.control_hz = 8.0
         self.control_dt = 1.0 / self.control_hz
         self.predict_time = 1.4
@@ -117,6 +117,12 @@ class PredictionGuiNode(Node):
             Float32MultiArray, "/dwa_static_obstacles_info", self.on_static_info_from_node, 10
         )
 
+        # 额外订阅 /scan_filtered：用于 GUI 展示“真正进入 costmap 的静态障碍”，
+        # 这样 GUI 静态与膨胀行为保持一致。
+        self.sub_scan_filtered = self.create_subscription(
+            LaserScan, "/scan_filtered", self.on_scan_filtered, 10
+        )
+
         self.get_logger().info(
             "DWA prediction GUI (pure listener) started. "
             "Subscribed to /odom, /gazebo/model_states, /scan, /velodyne_points, "
@@ -124,6 +130,32 @@ class PredictionGuiNode(Node):
         )
 
     # ========= ROS 回调 =========
+
+    def on_scan_filtered(self, msg: LaserScan):
+        """从 /scan_filtered 提取静态障碍点，只用于 GUI 显示，保证与 costmap 膨胀一致。"""
+        ranges = np.asarray(msg.ranges, dtype=np.float32)
+        valid_min = max(float(msg.range_min), 0.03)
+        valid = np.isfinite(ranges) & (ranges > valid_min) & (ranges < msg.range_max)
+        angles = msg.angle_min + np.arange(len(ranges), dtype=np.float32) * msg.angle_increment
+
+        xs: List[float] = []
+        ys: List[float] = []
+        for i in np.where(valid)[0]:
+            r = ranges[i]
+            a = angles[i]
+            xs.append(r * math.cos(a))
+            ys.append(r * math.sin(a))
+
+        if xs:
+            pts = np.column_stack((xs, ys)).astype(np.float32)
+        else:
+            pts = np.empty((0, 2), dtype=np.float32)
+
+        # 这里是激光坐标系下的点，但对于 GUI 来说，只看相对形状即可；
+        # 更重要的是，它和 costmap 使用的是同一份 /scan_filtered 数据。
+        with self._lock:
+            self._static_from_node = pts
+            self.last_static_stamp = time.monotonic()
 
     def on_odom(self, msg: Odometry):
         with self._lock:

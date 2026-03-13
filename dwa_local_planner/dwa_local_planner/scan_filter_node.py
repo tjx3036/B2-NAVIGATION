@@ -54,12 +54,16 @@ class ScanFilterNode(Node):
 
         from dwa_local_planner.obstacle_predictor_clean import ObstaclePredictor
 
-        static_confirm = self.declare_parameter("static_confirm_time", 0.5).value
+        # 小截面静态目标（站立行人、杆子）需要尽快被视为静态；
+        # 同时抑制由激光抖动导致的小速度误判为动态。
+        static_confirm = self.declare_parameter("static_confirm_time", 0.7).value
         cluster_eps = self.declare_parameter("cluster_eps", 0.18).value
         self.predictor = ObstaclePredictor(
-            dynamic_enter_speed=0.10,
-            dynamic_exit_speed=0.04,
-            dynamic_hold_time=0.8,
+            # 动态进入/退出速度阈值：抑制 <0.3m/s 的抖动被当成动态
+            dynamic_enter_speed=0.30,
+            dynamic_exit_speed=0.15,
+            # 持续时间：真实动态即便短暂停顿，仍保持一小段时间动态状态，避免拖影残留
+            dynamic_hold_time=1.0,
             static_confirm_time=float(static_confirm),
             cluster_eps=float(cluster_eps),
         )
@@ -70,7 +74,8 @@ class ScanFilterNode(Node):
         # 过滤半径：动态质心/轨迹/拖影的邻域，在此范围内的 scan 点将被过滤
         en = self.declare_parameter("enabled", True).value
         self.enabled = en if isinstance(en, bool) else str(en).lower() in ("true", "1", "yes")
-        self.filter_radius = self.declare_parameter("filter_radius", 0.42).value
+        # 过滤半径略小一点，减少多人场景下大面积“黑洞”，但仍能覆盖动态目标本体
+        self.filter_radius = self.declare_parameter("filter_radius", 0.45).value
         # 保护半径：仅保护静态障碍核心，不宜过大否则拖影在静态附近无法过滤
         self.protect_radius = self.declare_parameter("protect_radius", 0.36).value
         self.target_frame = self.declare_parameter("target_frame", "odom").value

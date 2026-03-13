@@ -314,8 +314,8 @@ class ObstaclePredictor:
         speed_ema_alpha: float = 0.25,
         vel_ema_alpha: float = 0.5,
         # 预测参数
-        predict_time: float = 1.5,
-        predict_dt: float = 0.15,
+        predict_time: float = 2.5,
+        predict_dt: float = 0.25,
         # 多帧速度：用最近 N 帧位置回归得到速度，避免相邻两帧噪声
         velocity_smooth_frames: int = 8,
         velocity_min_frames: int = 4,
@@ -809,8 +809,8 @@ class ObstaclePredictor:
         min_hits_to_predict: int = 3,
         min_speed_to_predict: float = 0.5,
         association_dist: float = 0.8,
-        predict_time: float = 1.4,
-        predict_dt: float = 0.1,
+        predict_time: float = 2.5,
+        predict_dt: float = 0.25,
         gate_mahalanobis: float = 3.0,
         meas_pos_var: float = 0.06,
         process_noise_pos: float = 0.25,

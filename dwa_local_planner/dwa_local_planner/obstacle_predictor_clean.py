@@ -278,15 +278,15 @@ class ObstaclePredictor:
         self,
         cluster_eps: float = 0.18,
         min_cluster_points: int = 1,
-        max_track_age: float = 1.5,
+        max_track_age: float = 1.0,
         min_hits_to_predict: int = 1,
         min_speed_to_predict: float = 0.08,
-        dynamic_enter_speed: float = 0.10,
-        dynamic_exit_speed: float = 0.04,
+        dynamic_enter_speed: float = 0.30,
+        dynamic_exit_speed: float = 0.10,
         dynamic_hold_time: float = 0.6,
         static_confirm_time: float = 0.5,
         association_dist: float = 0.5,
-        predict_time: float = 1.4,
+        predict_time: float = 0.7,
         predict_dt: float = 0.1,
         process_noise: float = 1.2,
         measurement_noise: float = 0.12,
@@ -393,27 +393,35 @@ class ObstaclePredictor:
 
     def _refresh_dynamic_states(self, t: float) -> None:
         for tr in self._tracks:
+            # 初期命中次数不足时，一律按“可能动态”处理，以免过早当静态抹掉
             if tr.hit_count < self.min_hits_to_predict:
                 tr.is_dynamic = True
                 continue
+
+            # 速度估计带噪，先对小于阈值的抖动归零，避免小目标+激光抖动被误判为动态
             spd = math.hypot(tr.vx, tr.vy)
-            if spd < 0.02:
+            if spd < 0.10:
                 spd = 0.0
+
+            # 进入动态：超过 dynamic_enter_speed，则视为动态，并保持至少 dynamic_hold_time
             if spd >= self.dynamic_enter_speed:
                 tr.is_dynamic = True
                 tr.dynamic_until = max(tr.dynamic_until, t + self.dynamic_hold_time)
                 tr.low_speed_since = 0.0
-            else:
-                if spd <= self.dynamic_exit_speed:
-                    if tr.low_speed_since <= 0.0:
-                        tr.low_speed_since = t
-                    if (t - tr.low_speed_since) >= self.static_confirm_time and t > tr.dynamic_until:
-                        tr.is_dynamic = False
-                    else:
-                        tr.is_dynamic = True
+                continue
+
+            # 低速段：只有长期低于 dynamic_exit_speed，且超过 static_confirm_time，且已过 dynamic_until，才转为“静态”
+            if spd <= self.dynamic_exit_speed:
+                if tr.low_speed_since <= 0.0:
+                    tr.low_speed_since = t
+                if (t - tr.low_speed_since) >= self.static_confirm_time and t > tr.dynamic_until:
+                    tr.is_dynamic = False
                 else:
                     tr.is_dynamic = True
-                    tr.low_speed_since = 0.0
+            else:
+                # 中间速度：仍按动态处理，但不延长 low_speed_since 计时
+                tr.is_dynamic = True
+                tr.low_speed_since = 0.0
 
     def get_current_obstacle_points(self) -> np.ndarray:
         if not self._tracks:

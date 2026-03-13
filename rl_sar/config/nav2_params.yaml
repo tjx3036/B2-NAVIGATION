@@ -133,7 +133,8 @@ global_costmap:
         observation_persistence: 0.2
         observation_sources: scan
         scan:
-          topic: /scan
+          # 使用 scan_filter_node 输出的 /scan_filtered，动态障碍已被剔除，只剩静态进入膨胀层
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
@@ -174,7 +175,8 @@ local_costmap:
         observation_persistence: 0.2
         observation_sources: scan
         scan:
-          topic: /scan
+          # 使用 scan_filter_node 输出的 /scan_filtered，动态障碍已被剔除，只剩静态进入膨胀层
+          topic: /scan_filtered
           max_obstacle_height: 2.0
           clearing: True
           marking: True
