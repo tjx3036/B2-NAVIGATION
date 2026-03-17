@@ -113,11 +113,11 @@ class ObstacleTrack:
     # 多帧位置历史 (t, x, y)，用于回归计算速度
     position_history: List[Tuple[float, float, float]] = field(default_factory=list)
 
-    # 输出用平滑位置，减少 GUI / 预测位置的跳变（内部关联仍用 x, y）
+    # 输出用平滑位置，减少对外暴露的预测位置跳变（内部关联仍用 x, y）
     px_out: float = 0.0
     py_out: float = 0.0
 
-    # 输出用平滑速度，减少 GUI 显示抖动
+    # 输出用平滑速度，减少对外暴露的速度抖动
     vx_out: float = 0.0
     vy_out: float = 0.0
 
@@ -267,7 +267,7 @@ class ObstacleTrack:
             self.vx = (1.0 - alpha_v) * prev_vx + alpha_v * self.vx
             self.vy = (1.0 - alpha_v) * prev_vy + alpha_v * self.vy
 
-        # 输出速度二次平滑，减轻 GUI 抖动
+        # 输出速度二次平滑，减轻对外暴露速度的抖动
         out_alpha = 0.28
         self.vx_out = (1.0 - out_alpha) * self.vx_out + out_alpha * self.vx
         self.vy_out = (1.0 - out_alpha) * self.vy_out + out_alpha * self.vy
@@ -527,7 +527,7 @@ class ObstaclePredictor:
     def get_dynamic_centroids(self, min_speed: float = 0.08) -> List[Tuple[float, float]]:
         """返回被认为是“动态”的轨迹当前质心，用于动静分离。"""
         dyn_tracks = self._iter_dynamic_tracks(min_speed)
-        # 用平滑位置，避免 GUI/动静分离出现跳变
+        # 用平滑位置，避免对外暴露/动静分离出现跳变
         return [(tr.px_out if tr.px_out != 0.0 or tr.py_out != 0.0 else tr.x,
                  tr.py_out if tr.px_out != 0.0 or tr.py_out != 0.0 else tr.y)
                 for tr in dyn_tracks]

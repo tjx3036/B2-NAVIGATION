@@ -53,7 +53,9 @@ class SACDWANode(Node):
         self.planner = DWAPlanner()
         self.planner.set_debug(False)
 
-        self.control_hz = 8.0           # 控制频率：提高控制连续性，减少“走走停停”
+        # 控制频率：同时决定 on_timer()、/cmd_vel 和本节点发布 /odom 的频率
+        # 提高到 10Hz，让 GUI 和 /odom 看起来更连续一些
+        self.control_hz = 10.0
         self.planner.control_interval = 1.0 / self.control_hz
 
         # 前瞻性避障：障碍物轨迹预测与跟踪（cluster_eps 稍大避免点云过细分簇）

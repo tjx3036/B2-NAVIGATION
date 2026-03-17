@@ -38,7 +38,8 @@ class DWAPlanner:
 
         # 控制与预测（control_interval 由 sac_dwa_node 按 control_hz 设置）
         self.control_interval = 0.05    # 默认 20Hz，与动态窗口 dt 一致
-        self.predict_time = 1.4         # 轨迹预测时长 (s)，提升大弯绕障前瞻能力
+        # 加长 DWA 内部轨迹预测时长，配合动态障碍预测做更远距离前瞻
+        self.predict_time = 2.5         # 轨迹预测时长 (s)
 
         # 采样：保留足够角度分辨率，避免算力过高
         self.velocity_samples = 6       # 线速度采样（进一步降算力）
