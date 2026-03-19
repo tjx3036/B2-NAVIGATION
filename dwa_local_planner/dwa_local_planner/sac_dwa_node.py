@@ -112,6 +112,11 @@ class SACDWANode(Node):
         self._recovery_turn_sign = 1.0
         self._no_feasible_boost_until_t = 0.0
 
+        # 视觉动态障碍物轨迹缓存：来自 /vision_dynamic_obstacles
+        # 每条记录为 (track_id, x, y, vx, vy) 在 base_link 坐标系下
+        self._vision_tracks = []
+        self._vision_tracks_lock = threading.Lock()
+
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
 
@@ -135,6 +140,14 @@ class SACDWANode(Node):
         )
         self.sub_costmap = self.create_subscription(
             OccupancyGrid, "/local_costmap/costmap", self.on_costmap, 10, callback_group=self._ctrl_group
+        )
+        # 视觉动态障碍物轨迹（来自相机/DepTR-MOT 桥接节点）
+        self.sub_vision_tracks = self.create_subscription(
+            Float32MultiArray,
+            "/vision_dynamic_obstacles",
+            self.on_vision_tracks,
+            10,
+            callback_group=self._ctrl_group,
         )
 
         self.pub_cmd = self.create_publisher(Twist, "/cmd_vel", 20)
@@ -170,6 +183,21 @@ class SACDWANode(Node):
         self.get_logger().info("FollowPath action server is active in sac_dwa_node.")
         if self._alias_map_to_odom:
             self.get_logger().warn("alias_map_to_odom enabled: treating map and odom as identical frames.")
+
+    def on_vision_tracks(self, msg: Float32MultiArray) -> None:
+        """
+        接收来自视觉侧的动态障碍物轨迹（占位接口）。
+        当前约定: data = [id, x, y, vx, vy, id2, x2, y2, vx2, vy2, ...]，单位在 base_link 坐标系下。
+        """
+        data = list(msg.data)
+        n = len(data) // 5
+        tracks = []
+        for i in range(n):
+            base = i * 5
+            tid, x, y, vx, vy = data[base : base + 5]
+            tracks.append((int(tid), float(x), float(y), float(vx), float(vy)))
+        with self._vision_tracks_lock:
+            self._vision_tracks = tracks
 
     def _on_goal(self, goal_request: FollowPath.Goal):
         if len(goal_request.path.poses) == 0:

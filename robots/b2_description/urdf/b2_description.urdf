@@ -638,7 +638,8 @@
     </inertial>
   </link>
   <joint name="f_oc_joint" type="fixed">
-    <origin xyz="0.39079 0 -0.013433" rpy="-1.5708 0 -1.5708" />
+    <!-- Place front optical center roughly at Velodyne position (front-top center of head) -->
+    <origin xyz="0.34918 0 0.17851" rpy="0 0 0" />
     <parent link="base_link" />
     <child link="f_oc_link" />
     <axis xyz="0 0 0" />

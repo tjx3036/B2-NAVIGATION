@@ -26,15 +26,15 @@ class DWAPlanner:
         三评分：direction(轨迹末端朝向目标)、obstacle(轨迹最近障碍距离)、velocity(v)。
         动态窗口用 control_interval 内的 accel/decel 约束采样范围。
         """
-        # 机器人物理参数：先保证“能动得起来”，再做细调
-        self.max_linear_speed = 1.2     # 最大线速度（提升巡航上限）
-        self.min_linear_speed = 0.03    # 最小线速度（减少长时间零速犹豫）
-        self.max_angular_speed = 2.2    # 最大角速度（增强绕障脱困能力）
-        self.min_angular_speed = -2.2   # 最小角速度
-        self.max_linear_accel = 2.6     # 线加速度（提升起步/再加速能力）
-        self.max_linear_decel = 1.2     # 线减速度
-        self.max_angular_accel = 2.8    # 角加速度
-        self.max_angular_decel = 2.8    # 角减速度
+        # 机器人物理参数：显著提高速度与转向能力，并允许原地旋转
+        self.max_linear_speed = 2.5     # 最大线速度 (m/s)
+        self.min_linear_speed = 0.0     # 允许 v=0，用于原地转弯
+        self.max_angular_speed = 3.0    # 最大角速度 (rad/s)，减小转弯半径
+        self.min_angular_speed = -3.0
+        self.max_linear_accel = 3.5     # 线加速度
+        self.max_linear_decel = 3.0     # 线减速度
+        self.max_angular_accel = 3.5    # 角加速度
+        self.max_angular_decel = 3.5    # 角减速度
 
         # 控制与预测（control_interval 由 sac_dwa_node 按 control_hz 设置）
         self.control_interval = 0.05    # 默认 20Hz，与动态窗口 dt 一致
